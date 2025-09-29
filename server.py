@@ -1,7 +1,8 @@
+import os
 import asyncio
 import websockets
 
-connected_ws = set()  # Store connected WebSocket clients (ESP)
+connected_ws = set()
 
 # ===== WebSocket handler (ESP8266) =====
 async def ws_handler(websocket):
@@ -14,34 +15,20 @@ async def ws_handler(websocket):
         connected_ws.remove(websocket)
         print("❌ ESP disconnected")
 
-# ===== TCP handler (PHP) =====
-async def tcp_handler(reader, writer):
-    data = await reader.read(1024)
-    message = data.decode().strip()
-    addr = writer.get_extra_info('peername')
-    print(f"📩 From PHP {addr}: {message}")
-
-    # Forward message to all WebSocket clients (ESP)
-    if connected_ws:
-        await asyncio.gather(*[ws.send(message) for ws in connected_ws])
-        print(f"➡️ Sent to ESP: {message}")
-    else:
-        print("⚠️ No ESP connected, message not forwarded")
-
-    writer.close()
-    await writer.wait_closed()
+# ===== Forward messages from Python (or PHP) =====
+# For Render, we can create a simple HTTP endpoint to receive PHP messages
+# or use a WebSocket message directly. TCP server on arbitrary port won't work.
 
 async def main():
-    # Start WebSocket server
-    ws_server = await websockets.serve(ws_handler, "0.0.0.0", 8765)
-    print("✅ WebSocket server running on ws://0.0.0.0:8765")
+    port = int(os.environ.get("PORT", 8765))  # Render provides this port
+    print(f"Using port: {port}")
 
-    # Start TCP server
-    tcp_server = await asyncio.start_server(tcp_handler, "0.0.0.0", 8766)
-    print("✅ TCP server running on 127.0.0.1:8766")
+    # WebSocket server
+    ws_server = await websockets.serve(ws_handler, "0.0.0.0", port)
+    print(f"✅ WebSocket server running on ws://0.0.0.0:{port}")
 
-    async with ws_server, tcp_server:
-        await asyncio.gather(ws_server.wait_closed(), tcp_server.serve_forever())
+    # Keep the server running
+    await ws_server.wait_closed()
 
 if __name__ == "__main__":
     asyncio.run(main())
