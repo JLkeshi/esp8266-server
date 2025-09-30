@@ -1,68 +1,93 @@
+# server.py
+import os
 import asyncio
-import websockets
-import logging
+from aiohttp import web, WSCloseCode
 
-# ===== Logging setup =====
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s [%(levelname)s] %(message)s',
-    datefmt='%H:%M:%S'
-)
+PORT = int(os.environ.get("PORT", 8765))  # Render will set PORT for web services
 
-connected_ws = set()  # Store connected WebSocket clients (ESP)
+connected_ws = set()
 
-# ===== WebSocket handler (ESP8266) =====
-async def ws_handler(websocket):
-    connected_ws.add(websocket)
-    logging.info("✅ ESP connected via WebSocket")
+async def index(request):
+    return web.Response(text="OK\n", status=200)
+
+# WebSocket handler for ESP (connect via wss://<your-service>/ws)
+async def ws_handler(request):
+    ws = web.WebSocketResponse()
+    await ws.prepare(request)
+
+    connected_ws.add(ws)
+    request.app['logger'].info("✅ ESP connected via WebSocket")
     try:
-        async for message in websocket:
-            logging.info(f"📩 From ESP: {message}")
-    except websockets.exceptions.ConnectionClosed:
-        logging.warning("⚠️ ESP connection closed unexpectedly")
+        async for msg in ws:
+            if msg.type == web.WSMsgType.TEXT:
+                request.app['logger'].info(f"📩 From ESP: {msg.data}")
+            elif msg.type == web.WSMsgType.ERROR:
+                request.app['logger'].error(f"WebSocket error: {ws.exception()}")
     finally:
-        connected_ws.discard(websocket)
-        logging.info("❌ ESP disconnected")
+        connected_ws.discard(ws)
+        request.app['logger'].info("❌ ESP disconnected")
+    return ws
 
-# ===== TCP handler (PHP) =====
-async def tcp_handler(reader, writer):
-    data = await reader.read(1024)
-    message = data.decode().strip()
-    addr = writer.get_extra_info('peername')
-    logging.info(f"📩 From PHP {addr}: {message}")
+# HTTP POST endpoint for PHP to send messages to ESP
+# Example PHP: file_get_contents('https://your-service/send'), or curl POST JSON/form
+async def send_handler(request):
+    # Accept JSON or form or raw text
+    if request.content_type == 'application/json':
+        payload = await request.json()
+        message = payload.get('message', '')
+    else:
+        # fallback: read raw text or form
+        data = await request.post() if request.can_read_body else {}
+        message = data.get('message')
+        if message is None:
+            body = await request.text()
+            message = body.strip()
 
-    # Forward message to all connected WebSocket clients (ESP)
+    if not message:
+        return web.json_response({'ok': False, 'error': 'no message provided'}, status=400)
+
+    # forward to all connected WebSocket clients (ESP)
     if connected_ws:
         disconnected = set()
-        for ws in connected_ws:
+        for ws in list(connected_ws):
             try:
-                await ws.send(message)
-            except websockets.exceptions.ConnectionClosed:
+                await ws.send_str(message)
+            except Exception as e:
+                request.app['logger'].warning(f"Failed to send to ws: {e}")
                 disconnected.add(ws)
-        # Remove disconnected clients
         connected_ws.difference_update(disconnected)
-        logging.info(f"➡️ Sent to ESP: {message}")
+        request.app['logger'].info(f"➡️ Sent to ESP: {message}")
+        return web.json_response({'ok': True, 'sent_to': len(connected_ws)})
     else:
-        logging.warning("⚠️ No ESP connected, message not forwarded")
+        request.app['logger'].warning("⚠️ No ESP connected, message not forwarded")
+        return web.json_response({'ok': False, 'error': 'no connected devices'}, status=503)
 
-    writer.close()
-    await writer.wait_closed()
 
-# ===== Main server setup =====
-async def main():
-    # Start WebSocket server
-    ws_server = await websockets.serve(ws_handler, "0.0.0.0", 8765)
-    logging.info("✅ WebSocket server running on ws://0.0.0.0:8765")
+async def on_startup(app):
+    app['logger'].info(f"Server startup. Listening on 0.0.0.0:{PORT}")
 
-    # Start TCP server
-    tcp_server = await asyncio.start_server(tcp_handler, "0.0.0.0", 8766)
-    logging.info("✅ TCP server running on 0.0.0.0:8766")
+async def on_cleanup(app):
+    # close all websockets on shutdown
+    for ws in list(connected_ws):
+        try:
+            await ws.close(code=WSCloseCode.GOING_AWAY, message='Server shutting down')
+        except:
+            pass
+    app['logger'].info("Server cleanup complete.")
 
-    async with ws_server, tcp_server:
-        await asyncio.gather(ws_server.wait_closed(), tcp_server.serve_forever())
+def create_app():
+    app = web.Application()
+    app.add_routes([
+        web.get('/', index),
+        web.get('/ws', ws_handler),
+        web.post('/send', send_handler),
+    ])
+    app.on_startup.append(on_startup)
+    app.on_cleanup.append(on_cleanup)
+    return app
 
-if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        logging.info("🛑 Server stopped manually")
+if __name__ == '__main__':
+    import logging
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
+    app = create_app()
+    web.run_app(app, host='0.0.0.0', port=PORT)
