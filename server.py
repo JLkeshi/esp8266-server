@@ -1,65 +1,68 @@
-import os
 import asyncio
 import websockets
-import json
+import logging
 
-connected_ws = set()  # Store connected ESP clients
+# ===== Logging setup =====
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    datefmt='%H:%M:%S'
+)
+
+connected_ws = set()  # Store connected WebSocket clients (ESP)
 
 # ===== WebSocket handler (ESP8266) =====
 async def ws_handler(websocket):
     connected_ws.add(websocket)
-    print("✅ ESP connected via WebSocket")
+    logging.info("✅ ESP connected via WebSocket")
     try:
         async for message in websocket:
-            print(f"📩 From ESP: {message}")
+            logging.info(f"📩 From ESP: {message}")
+    except websockets.exceptions.ConnectionClosed:
+        logging.warning("⚠️ ESP connection closed unexpectedly")
     finally:
-        connected_ws.remove(websocket)
-        print("❌ ESP disconnected")
+        connected_ws.discard(websocket)
+        logging.info("❌ ESP disconnected")
 
-# ===== HTTP POST handler (for PHP commands) =====
-async def http_handler(reader, writer):
-    # Read HTTP request
+# ===== TCP handler (PHP) =====
+async def tcp_handler(reader, writer):
     data = await reader.read(1024)
-    request = data.decode()
-    
-    # Extract command from POST body
-    try:
-        body = request.split("\r\n\r\n")[1]
-        cmd_data = json.loads(body)
-        command = cmd_data.get("command", "")
-        print(f"📩 Command from PHP: {command}")
+    message = data.decode().strip()
+    addr = writer.get_extra_info('peername')
+    logging.info(f"📩 From PHP {addr}: {message}")
 
-        # Forward to all connected ESP clients
-        if connected_ws:
-            await asyncio.gather(*[ws.send(command) for ws in connected_ws])
-            print(f"➡️ Sent to ESP: {command}")
-        else:
-            print("⚠️ No ESP connected")
-    except Exception as e:
-        print("❌ Error parsing request:", e)
+    # Forward message to all connected WebSocket clients (ESP)
+    if connected_ws:
+        disconnected = set()
+        for ws in connected_ws:
+            try:
+                await ws.send(message)
+            except websockets.exceptions.ConnectionClosed:
+                disconnected.add(ws)
+        # Remove disconnected clients
+        connected_ws.difference_update(disconnected)
+        logging.info(f"➡️ Sent to ESP: {message}")
+    else:
+        logging.warning("⚠️ No ESP connected, message not forwarded")
 
-    # Respond to PHP
-    response = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nOK"
-    writer.write(response.encode())
-    await writer.drain()
     writer.close()
     await writer.wait_closed()
 
+# ===== Main server setup =====
 async def main():
-    # Use Render's assigned port
-    port = int(os.environ.get("PORT", 8765))
-    print(f"Using Render port: {port}")
-
     # Start WebSocket server
-    ws_server = await websockets.serve(ws_handler, "0.0.0.0", port)
-    print(f"✅ WebSocket running on 0.0.0.0:{port}")
+    ws_server = await websockets.serve(ws_handler, "0.0.0.0", 8765)
+    logging.info("✅ WebSocket server running on ws://0.0.0.0:8765")
 
-    # Start lightweight TCP server for PHP POST commands
-    tcp_server = await asyncio.start_server(http_handler, "0.0.0.0", port)
-    print(f"✅ HTTP command endpoint running on 0.0.0.0:{port}")
+    # Start TCP server
+    tcp_server = await asyncio.start_server(tcp_handler, "0.0.0.0", 8766)
+    logging.info("✅ TCP server running on 0.0.0.0:8766")
 
     async with ws_server, tcp_server:
         await asyncio.gather(ws_server.wait_closed(), tcp_server.serve_forever())
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logging.info("🛑 Server stopped manually")
